@@ -3,7 +3,7 @@ from __future__ import unicode_literals
 
 # xbmc imports
 from xbmcaddon import Addon
-from xbmc import executebuiltin
+from xbmc import executebuiltin,log,LOGINFO
 from xbmcgui import Dialog, DialogProgress
 
 # codequick imports
@@ -13,18 +13,18 @@ from codequick.script import Settings
 from codequick.storage import PersistentDict
 
 # add-on imports
-from resources.lib.utils import getTokenParams, getHeaders, isLoggedIn, login as ULogin, logout as ULogout, check_addon, sendOTP, get_local_ip, getChannelHeaders
+from resources.lib.utils import getTokenParams, getHeaders, isLoggedIn, login as ULogin, logout as ULogout, check_addon, sendOTP, get_local_ip, getChannelHeaders, quality_to_enum
 from resources.lib.constants import GET_CHANNEL_URL, PLAY_EX_URL, EXTRA_CHANNELS, GENRE_MAP, LANG_MAP, FEATURED_SRC, CONFIG, CHANNELS_SRC, IMG_CATCHUP, PLAY_URL, IMG_CATCHUP_SHOWS, CATCHUP_SRC, M3U_SRC, EPG_SRC, M3U_CHANNEL
 
 # additional imports
 import urlquick
+from uuid import uuid4
 from urllib.parse import urlencode
 import inputstreamhelper
 import json
-import m3u8
 from time import time, sleep
 from datetime import datetime, timedelta, date
-
+import m3u8
 
 # Root path of plugin
 @Route.register
@@ -110,7 +110,10 @@ def show_featured(plugin, id=None):
                         info_dict["params"] = {
                             "channel_id": child.get("channel_id"),
                             "showtime": child.get("showtime", "").replace(":", ""),
-                            "srno": datetime.fromtimestamp(int(child.get("startEpoch", 0)*.001)).strftime('%Y%m%d')
+                            "srno": datetime.fromtimestamp(int(child.get("startEpoch", 0)*.001)).strftime('%Y%m%d'),
+                            "programId":  child.get("srno", ""),
+                            "begin":  datetime.utcfromtimestamp(int(child.get("startEpoch", 0)*.001)).strftime('%Y%m%dT%H%M%S'),
+                            "end":  datetime.utcfromtimestamp(int(child.get("endEpoch", 0)*.001)).strftime('%Y%m%dT%H%M%S')
                         }
                         yield Listitem.from_dict(**info_dict)
         else:
@@ -216,7 +219,10 @@ def show_epg(plugin, day, channel_id):
             "params": {
                 "channel_id": each.get("channel_id"),
                 "showtime": None if islive else each.get("showtime", "").replace(":", ""),
-                "srno": None if islive else datetime.fromtimestamp(int(each.get("startEpoch", 0)*.001)).strftime('%Y%m%d')
+                "srno": None if islive else datetime.fromtimestamp(int(each.get("startEpoch", 0)*.001)).strftime('%Y%m%d'),
+                "programId": None if islive else each.get("srno", ""),
+                "begin": None if islive else datetime.utcfromtimestamp(int(each.get("startEpoch", 0)*.001)).strftime('%Y%m%dT%H%M%S'),
+                "end": None if islive else datetime.utcfromtimestamp(int(each.get("endEpoch", 0)*.001)).strftime('%Y%m%dT%H%M%S')
             }
         })
     if int(day) == 0:
@@ -264,7 +270,8 @@ def play_ex(plugin, dt=None):
 # Also insures that user is logged in.
 @Resolver.register
 @isLoggedIn
-def play(plugin, channel_id, showtime=None, srno=None):
+def play(plugin, channel_id, showtime=None, srno=None , programId=None, begin=None, end=None):
+    # import web_pdb; web_pdb.set_trace()
     is_helper = inputstreamhelper.Helper("mpd", drm="com.widevine.alpha")
     hasIs = is_helper.check_inputstream()
     if not hasIs:
@@ -276,32 +283,55 @@ def play(plugin, channel_id, showtime=None, srno=None):
             if extra.get(str(channel_id)).get("ext"):
                 return extra.get(str(channel_id)).get("ext")
             return PLAY_EX_URL + extra.get(str(channel_id)).get("data")
-
     rjson = {
         "channel_id": int(channel_id),
         "stream_type": "Seek"
     }
+    isCatchup = False      
     if showtime and srno:
+        isCatchup = True
         rjson["showtime"] = showtime
         rjson["srno"] = srno
         rjson["stream_type"] = "Catchup"
-
+        rjson["programId"] = programId
+        rjson["begin"] = begin
+        rjson["end"] = end
+        Script.log(str(rjson), lvl=Script.INFO)
     headers = getHeaders()
     headers['channelid'] = str(channel_id)
-    headers['srno'] = "1"
-    resp = urlquick.post(GET_CHANNEL_URL, json=rjson, headers=getChannelHeaders(), max_age=-1).json()
+    headers['srno'] = str(uuid4()) if "srno" not in rjson else rjson["srno"]
+    res = urlquick.post(GET_CHANNEL_URL, json=rjson, headers=getChannelHeaders(), max_age=-1)
+    resp = res.json()
     art = {}
     onlyUrl = resp.get("result", "").split("?")[0].split('/')[-1]
     art["thumb"] = art["icon"] = IMG_CATCHUP + \
         onlyUrl.replace(".m3u8", ".png")
-    headers['cookie'] = resp.get("result", "").split("?")[-1]
-    params = getTokenParams()
+    cookie = "__hdnea__"+resp.get("result", "").split("__hdnea__")[-1]
+    headers['cookie'] = cookie
     uriToUse = resp.get("result","")
-    m3u8String = urlquick.get(resp.get("result",""), headers=headers, max_age=-1).text
-    variant_m3u8 = m3u8.loads(m3u8String)
-    if variant_m3u8.is_variant:
-        quality = len(variant_m3u8.playlists) - 1
-        uriToUse = uriToUse.replace(onlyUrl, variant_m3u8.playlists[quality].uri)
+    qltyopt = Settings.get_string("quality")
+    selectionType = "adaptive"
+    if qltyopt == 'Manual':
+        selectionType = "ask-quality"
+    else:  
+        m3u8Headers = {}
+        m3u8Headers['user-agent'] = headers['user-agent']
+        m3u8Headers['cookie'] = cookie
+        m3u8Res = urlquick.get(uriToUse, headers=m3u8Headers, max_age=-1 , raise_for_status=True , timeout=5)
+        m3u8String = m3u8Res.text
+        variant_m3u8 = m3u8.loads(m3u8String)
+        if variant_m3u8.is_variant and (variant_m3u8.version is None or variant_m3u8.version < 7):
+            quality = quality_to_enum(qltyopt, len(variant_m3u8.playlists))
+            if isCatchup:
+                tmpurl = variant_m3u8.playlists[quality].uri
+                if "?" in tmpurl:
+                    uriToUse = uriToUse.split("?")[0].replace(onlyUrl,tmpurl)
+                else:
+                    uriToUse = uriToUse.replace(onlyUrl, tmpurl.split("?")[0])
+                del headers['cookie']
+            else:
+                uriToUse = uriToUse.replace(onlyUrl, variant_m3u8.playlists[quality].uri)
+    Script.log(uriToUse, lvl=Script.INFO)
     return Listitem().from_dict(**{
         "label": plugin._title,
         "art": art,
@@ -309,9 +339,11 @@ def play(plugin, channel_id, showtime=None, srno=None):
         "properties": {
             "IsPlayable": True,
             "inputstream": "inputstream.adaptive",
-            "inputstream.adaptive.stream_headers": "User-Agent=plaYtv/7.0.8 (Linux;Android 9) ExoPlayerLib/2.11.7",
+            'inputstream.adaptive.stream_selection_type': selectionType,
+            "inputstream.adaptive.chooser_resolution_secure_max": "4K",
+            "inputstream.adaptive.stream_headers": urlencode(headers),
             "inputstream.adaptive.manifest_type": "hls",
-            "inputstream.adaptive.license_key": urlencode(params) + "|" + urlencode(headers) + "|R{SSM}|",
+            "inputstream.adaptive.license_key": "|" + urlencode(headers) + "|R{SSM}|",
         }
     })
 
@@ -372,7 +404,7 @@ def m3ugen(plugin, notify="yes"):
             "channel_id={0}".format(channel.get("channel_id"))
         catchup = ""
         if channel.get("isCatchupAvailable"):
-            catchup = ' catchup="vod" catchup-source="{0}channel_id={1}&showtime={{H}}{{M}}{{S}}&srno={{Y}}{{m}}{{d}}" catchup-days="7"'.format(
+            catchup = ' catchup="vod" catchup-source="{0}channel_id={1}&showtime={{H}}{{M}}{{S}}&srno={{Y}}{{m}}{{d}}&programId={{catchup-id}}" catchup-days="7"'.format(
                 PLAY_URL, channel.get("channel_id"))
         m3ustr += M3U_CHANNEL.format(
             tvg_id=channel.get("channel_id"),
